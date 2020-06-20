@@ -1,7 +1,8 @@
-const {parse_items} = require('./utils');
+const {cash_format, parse_items, parse_store_items} = require('./utils');
+const {is_gm} = require('./role');
 const {jco, co} = require('../utils')
 const db = require('../db');
-const {User, Item, UserItems} = require('../models');
+const {User, Item, UserItems, Store, StoreItems} = require('../models');
 const {client} = require('../line');
 
 module.exports = {
@@ -40,7 +41,7 @@ module.exports = {
                 return "尚未註冊";
             }
             
-            return `${u.name} 擁有的的金幣: ${u.cash}`
+            return `${u.name} 擁有的的金幣: ${cash_format(u.cash)}`
         });
     },
     item(event, name) {
@@ -51,13 +52,17 @@ module.exports = {
             }
             
             if (u.Items.length === 0) {
-                return `${u.name}擁有的的金幣: ${u.cash}\n沒有道具`
+                return `${u.name}擁有的的金幣: ${cash_format(u.cash)}\n沒有道具`
             }
-            return u.Items.reduce((s, item) => s+=`${item.name}: ${item.userItems.quantity}\n`, `${u.name}擁有的的金幣: ${u.cash}\n道具欄:\n`);
+            return u.Items.filter((item) => item.userItems.quantity > 0).reduce((s, item) => s+=`${item.name}: ${item.userItems.quantity}\n`, `${u.name}擁有的的金幣: ${cash_format(u.cash)}\n道具欄:\n`);
         });;
     },
     give(event, uname, ...items) {
         const uid = event.source.userId;
+        if (!is_gm(uid)) {
+            return "只有GM可以輸入這個指令.";
+        }
+
         const _items = parse_items(items);
         
         if (_items.cash === 0 && Object.keys(_items.items).length === 0) {
@@ -249,6 +254,140 @@ module.exports = {
         });
     },
     users(event) {
+        if (!is_gm(event.source.userId)) {
+            return "只有GM可以輸入這個指令.";
+        }
+
         return User.findAll().then((us) => '玩家:'+us.map((u) => u.name).join(','));
+    },
+    store(event, ...items) {
+        if (!is_gm(event.source.userId)) {
+            return "只有GM可以輸入這個指令.";
+        }
+
+        return Store.scope('global', 'items').findOrCreate({where: {}, defaults: { name: "__global__"}}).then((ss) => {
+            const s = ss[0];
+            if (items.length === 0) {
+                if (s.Items.every((item) => item.storeItems.quantity === 0)) {
+                    return "商店目前沒有商品.";
+                }
+                return s.Items.filter((item) => item.storeItems.quantity > 0).reduce((s, item) => s+=`${item.name} x${item.storeItems.quantity} : \$ ${cash_format(item.storeItems.price)}\n`, `販賣的道具:\n`);
+            }
+            
+            const _items = parse_store_items(items);
+            const item_names = Object.keys(_items);
+            return Item.findAll({where: {name: item_names}}).then((is) => {
+                const not_exist_item = item_names.filter((name) => !is.find((i) => i.name === name));
+                if (not_exist_item.length === 0) {
+                    return is;
+                }
+
+                return Item.bulkCreate(not_exist_item.map((i) => ({ name: i }))).then((is2) => is.concat(is2));
+            }).then((is) => db.transaction(t => {
+                const not_owned_items = is.filter((i) => !s.Items.find((j) => i.name === j.name));
+                const owned_items = is.filter((i) => s.Items.find((j) => i.name === j.name));
+                let p_arr = [];
+                
+                if (not_owned_items.length !== 0) {
+                    p_arr.push(StoreItems.bulkCreate(not_owned_items.map((i) => ({
+                        StoreId: s.id,
+                        ItemId: i.id,
+                        quantity: _items[i.name].quantity,
+                        price: _items[i.name].price,
+                    })), {transaction: t}));
+                }
+
+                p_arr.concat(owned_items.map((i) => StoreItems.update(_items[i.name], {
+                    where: {
+                        StoreId: s.id,
+                        ItemId: i.id,
+                    }
+                }, {transaction: t})));
+
+                return Promise.all(p_arr);
+            })).then(() => Store.scope('global', 'items').findOne()).
+                then((s) => s.Items.filter((item) => item.storeItems.quantity > 0).reduce((s, item) => s+=`${item.name} x${item.storeItems.quantity} : \$ ${cash_format(item.storeItems.price)}\n`, `販賣的道具:\n`));
+        });
+    },
+    buy(event, ...items) {
+        const uid = event.source.userId;
+        return Promise.all([
+            User.scope('items', {method: ['who', uid]}).findOne(),
+            Store.scope('global', 'items').findOne(),
+        ]).then(res => {
+            const u = res[0], s = res[1];
+            if (!u) {
+                return "尚未註冊";
+            }
+            if (!s) {
+                return "商店尚未開張.";
+            }
+
+            const _items = parse_items(items);
+            const item_names = Object.keys(_items.items);
+            const not_sell_items = item_names.filter((i) => !s.Items.find((j) => i === j.name));
+            if (not_sell_items.length !== 0) {
+                return ["沒有販賣下列商品:"].concat(not_sell_items).join('\n');
+            }
+
+            const mapped_items = item_names.map((i) => s.Items.find((j) => i === j.name));
+            const not_enough_items = mapped_items.filter((i) => i.storeItems.quantity < _items.items[i.name]);
+            if (not_enough_items.length !== 0) {
+                return ["下列商品數量不足夠:"].concat(not_enough_items.map((i) => `${i.name}x${_items.items[i.name] - i.storeItems.quantity}`)).join('\n');
+            }
+
+            const total = mapped_items.reduce((acc, i) => acc + _items.items[i.name] * i.storeItems.price, 0);
+            if (u.cash < total) {
+                return `玩家金幣不夠: ${cash_format(total - u.cash)}`;
+            }
+
+            return db.transaction(t => {
+                let p_arr = [u.decrement('cash', {by: total, transaction: t})];
+
+                const user_not_owned_items = mapped_items.filter((i) => !u.Items.find((j) => i.name === j.name));
+                const user_owned_items = mapped_items.filter((i) => u.Items.find((j) => i.name === j.name));
+                if (user_not_owned_items.length !== 0) {
+                    p_arr.push(UserItems.bulkCreate(user_not_owned_items.map((i) => ({
+                        UserId: u.id,
+                        ItemId: i.id,
+                        quantity: +_items.items[i.name],
+                    })), {transaction: t}));
+                }
+
+                if (user_owned_items.length !== 0) {
+                    const qty_obj = user_owned_items.reduce((obj, i) => {
+                        const qty = _items.items[i.name];
+                        if (!(qty in obj)) {
+                            obj[qty] = [];
+                        }
+                        obj[qty].push(i.name);
+                        return obj;
+                    }, {})
+                    p_arr.push(Promise.all(Object.keys(qty_obj).
+                                           map((qty) =>
+                                               u.getItems({where: {name: qty_obj[qty]}}).
+                                               then((is) =>
+                                                    UserItems.increment('quantity', {
+                                                        by: +qty,
+                                                        transaction: t,
+                                                        where: {
+                                                            UserId: u.id,
+                                                            ItemId: is.map((i) => i.id),
+                                                        }})))));
+                    p_arr.push(Promise.all(Object.keys(qty_obj).
+                                           map((qty) =>
+                                               s.getItems({where: {name: qty_obj[qty]}}).
+                                               then((is) =>
+                                                    StoreItems.decrement('quantity', {
+                                                        by: +qty,
+                                                        transaction: t,
+                                                        where: {
+                                                            StoreId: s.id,
+                                                            ItemId: is.map((i) => i.id),
+                                                        }})))));
+                }
+                return Promise.all(p_arr);
+            }).then(() => `購買成功, 尚餘 ${cash_format(u.cash - total)}.` );
+        });
     },
 };
